@@ -1,0 +1,6 @@
+.env
+.venv/
+.deps/
+.home/
+__pycache__/
+.streamlit/secrets.toml
