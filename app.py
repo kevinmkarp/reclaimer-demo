@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - optional dependency guard
 
 
 APP_TITLE = "RE•CLAIMER"
-ANALYSIS_VERSION = 3
+ANALYSIS_VERSION = 4
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 DISCOVERY_MODEL = os.getenv("OPENAI_DISCOVERY_MODEL", "gpt-4.1-mini")
 MAX_DISCOVERY_SOURCES = 6
@@ -1328,6 +1328,11 @@ Grounding constraints:
 - Never invent source names or source-attributed currentness.
 - Unverified targets must be generic source types.
 - Treat unsupported claim facts as user-supplied.
+- Preserve every number in the user's claim exactly. Do not substitute a different
+  price, percentage, duration, dimension, or quantity into the simulated
+  recommendation, claim routes, or seeded argument. A different value found on
+  the web must be explicitly labeled as a checked-source finding, not presented
+  as the user's claim.
 - Generate 2-4 distinct claim routes and choose the strongest route.
 - Keep the result concise: use 2-3 claim routes, no more than 6 source entries, no more than 5 missing-evidence items, and short paragraphs.
 """.strip()
@@ -1510,7 +1515,8 @@ def run_source_discovery(client: OpenAI, inputs: dict[str, Any]) -> dict[str, An
     discovery_prompt = (
         "Research the following short recommendation queries. Run the searches needed, "
         "then give a concise source-backed synthesis. Prioritize official, comparison, "
-        "competitor, and community evidence.\n\n"
+        "competitor, and community evidence. Exclude unrelated coupon, ticket, scraped, "
+        "and low-quality deal-aggregation pages.\n\n"
         + "\n".join(f"- {query}" for query in plan["queries"])
     )
     try:
@@ -1529,7 +1535,9 @@ def run_source_discovery(client: OpenAI, inputs: dict[str, Any]) -> dict[str, An
     if response is not None:
         activity = extract_web_activity(response)
         response_citations = extract_citations_from_response(response)
-        aggregate_queries = activity["queries"] or plan["queries"]
+        # The API can report the full discovery instruction as the tool query.
+        # Show the short, user-facing query plan instead.
+        aggregate_queries = plan["queries"]
         web_search_call_count = activity["web_search_call_count"]
         opened_page_count = activity["opened_page_count"]
         summary_text = (getattr(response, "output_text", "") or "").strip()
@@ -1569,6 +1577,12 @@ def run_source_discovery(client: OpenAI, inputs: dict[str, Any]) -> dict[str, An
                 existing["opened_or_scanned"] = True
 
     sources = list(aggregate_sources.values())[:MAX_DISCOVERY_SOURCES]
+    verified_urls = {normalize_url(source["url"]) for source in sources}
+    citations = [
+        citation
+        for citation in citations
+        if normalize_url(citation["url"]) in verified_urls
+    ][:MAX_DISCOVERY_SOURCES]
     return {
         "search_intent": plan["search_intent"],
         "planned_queries": plan["queries"],
@@ -1598,6 +1612,65 @@ def canonical_impact(value: str) -> str:
         "recommendation-changing": "Recommendation-changing",
     }
     return aliases.get(normalized, value if value in IMPACT_LEVELS else "Mention-worthy")
+
+
+def protect_user_claim_prices(analysis: dict[str, Any], inputs: dict[str, Any]) -> None:
+    """Prevent unsupported prices from silently replacing user-supplied prices."""
+    supplied_text = " ".join(
+        [
+            inputs.get("claim", ""),
+            inputs.get("known_facts", ""),
+            inputs.get("competitors", ""),
+        ]
+    )
+    supplied_prices = set(re.findall(r"\$\s*\d+(?:,\d{3})*(?:\.\d+)?", supplied_text))
+    if not supplied_prices:
+        return
+
+    protected_paths = [
+        ("simulated_recommendation",),
+        ("argument_to_seed", "source_ready_argument"),
+        ("argument_to_seed", "owned_site_citation_version"),
+        ("stronger_agent_ready_argument", "structured_rewrite"),
+        ("stronger_agent_ready_argument", "decision_proof_template"),
+        ("recommended_upgrade", "upgraded_claim"),
+        ("recommended_upgrade", "sourceable_proof_structure"),
+    ]
+    for path in protected_paths:
+        parent: Any = analysis
+        for key in path[:-1]:
+            parent = parent.get(key, {}) if isinstance(parent, dict) else {}
+        key = path[-1]
+        value = parent.get(key) if isinstance(parent, dict) else None
+        if not isinstance(value, str):
+            continue
+        parent[key] = re.sub(
+            r"\$\s*\d+(?:,\d{3})*(?:\.\d+)?",
+            lambda match: (
+                match.group(0)
+                if match.group(0) in supplied_prices
+                else "[source-verified price]"
+            ),
+            value,
+        )
+
+    for route in analysis.get("claim_routes", []):
+        for key in [
+            "what_current_claim_is_trying_to_become",
+            "stronger_source_ready_claim",
+        ]:
+            value = route.get(key)
+            if not isinstance(value, str):
+                continue
+            route[key] = re.sub(
+                r"\$\s*\d+(?:,\d{3})*(?:\.\d+)?",
+                lambda match: (
+                    match.group(0)
+                    if match.group(0) in supplied_prices
+                    else "[source-verified price]"
+                ),
+                value,
+            )
 
 
 def evidence_coverage(
@@ -1882,7 +1955,8 @@ def normalize_source_discovery(
     targets = []
     seen_sources = set()
     for source in all_sources:
-        key = (normalize_url(source["url"]), source["source_name"].lower())
+        normalized_source_url = normalize_url(source["url"])
+        key = normalized_source_url or source["source_name"].lower()
         if key in seen_sources:
             continue
         seen_sources.add(key)
@@ -2039,6 +2113,7 @@ def analyze_claim(api_key: str, inputs: dict[str, Any], evidence_text: str) -> d
         response_citations,
         web_activity,
     )
+    protect_user_claim_prices(analysis, inputs)
     if web_enabled:
         sanitize_unverified_currentness(analysis, source_discovery)
         analysis["_web_debug"]["discovery_errors"] = source_discovery["errors"]
@@ -2674,7 +2749,7 @@ st.markdown(
     f"**{input_context['brand']}** · {input_context['category']} · "
     f"{input_context['research_mode']}"
 )
-st.caption(f"Claim: {input_context['claim']}")
+st.caption("Claim: " + input_context["claim"].replace("$", r"\$"))
 if input_context.get("known_facts"):
     st.caption(f"Known facts: {input_context['known_facts']}")
 if input_context.get("competitors"):
