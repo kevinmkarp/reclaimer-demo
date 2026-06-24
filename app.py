@@ -23,7 +23,7 @@ except Exception:  # pragma: no cover - optional dependency guard
 
 
 APP_TITLE = "RE•CLAIMER"
-ANALYSIS_VERSION = 2
+ANALYSIS_VERSION = 3
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
 DISCOVERY_MODEL = os.getenv("OPENAI_DISCOVERY_MODEL", "gpt-4.1-mini")
 MAX_DISCOVERY_SOURCES = 6
@@ -2582,7 +2582,16 @@ with st.form("claim_form"):
             placeholder="Known competitors or comparison set, if any.",
             height=110,
         )
-        research_mode = st.selectbox("Research mode", RESEARCH_MODES, index=0)
+        default_research_mode = (
+            "Web-grounded"
+            if active_api_key and "Web-grounded" in RESEARCH_MODES
+            else "No web"
+        )
+        research_mode = st.selectbox(
+            "Research mode",
+            RESEARCH_MODES,
+            index=RESEARCH_MODES.index(default_research_mode),
+        )
 
     uploaded_files = st.file_uploader(
         "Uploaded evidence files (optional)",
